@@ -22,22 +22,51 @@ include     include/kernel.inc
 
             ; VDP port assignments
 
-#define     VDPREG 5
-#define     VDPRAM 1
+#define     EXP_PORT  1                 ; port expander address if in use
+#define     VDP_GROUP 1                 ; port group of the video card
 
-#define     RDRAM 00h
-#define     WRRAM 40h
-#define     WRREG 80h
+#define     VDP_REG 7                   ; address of the 9918 register port
+#define     VDP_RAM 6                   ; address of the 9918 memory port
 
-#define     null 0
+#define     VDP_RAM_R 00h               ; flag for memory read operation
+#define     VDP_RAM_W 40h               ; flag for memory write operation
+#define     VDP_REG_W 80h               ; flag for register write operation
+
+#define     PS2_P b2                    ; ps/2 port positive polarity test
+#define     PS2_N bn2                   ; ps/2 port negative polarity test
+
+#define     null 0                      ; better for empty pointers than 0
+
+
+            ; 9918 constant values
+
+blue:       equ   4
+red:        equ   6
+green:      equ   12
+gray:       equ   14
+white:      equ   15
+
+fgcolor:    equ   white
+bgcolor:    equ   blue
+
+
+            ; Control characters
+
+etx:        equ   3
+bs:         equ   8
+lf:         equ   10
+cr:         equ   13
+del:        equ   127
+
 
             ; table constants and locations
 
-rows:       equ 24
-cols:       equ 40
+rows:       equ   24
+cols:       equ   40
+chars:      equ   rows*cols
 
-patterns:   equ 3800h
-names:      equ 3c00h
+pattern:    equ   3800h                 ; character set in video memory
+names:      equ   3c00h                 ; display data in video memory
 
 
             ; Executable program header
@@ -47,40 +76,201 @@ names:      equ 3c00h
             dw    end-start
             dw    start
 
-start:      org   2000h
-            br    main
+start:      br    main
 
 
             ; Build information
 
-            db    3+80h                 ; month
-            db    6                     ; day
+            db    6+80h                 ; month
+            db    3                     ; day
             dw    2022                  ; year
-            dw    1                     ; build
+            dw    2                     ; build
 
-            db    'See github.com/dmadole/Elfos-video for more info',0
+            db    'See github.com/dmadole/Elfos-pstwo for more info',0
 
 
             ; Check minimum kernel version we need before doing anything else,
             ; in particular we need support for the heap manager to allocate
             ; memory for the persistent module to use.
 
-main:       ldi   high k_ver            ; get pointer to kernel version
+main:       ldi   k_ver.1               ; get pointer to kernel version
             phi   r7
-            ldi   low k_ver
+            ldi   k_ver.0
             plo   r7
 
             lda   r7                    ; if major is non-zero we are good
-            lbnz  allocmem
+            lbnz  chkopts
 
             lda   r7                    ; if major is zero and minor is 4
             smi   4                     ;  or higher we are good
-            lbdf  allocmem
+            lbdf  chkopts
 
             sep   scall                 ; if not meeting minimum version
             dw    o_inmsg
-            db    'ERROR: Needs kernel version 0.4.0 or higher',13,10,0
+            db    'ERROR: Needs kernel version 0.4.0 or higher',cr,lf,0
+            sep   sret
 
+
+            ; Check for any command line options and set flags accordingly.
+
+chkopts:    ldi   0                     ; clear flag for uninstall
+            plo   rd
+
+
+skipspc:    lda   ra                    ; skip any leading spaces
+            lbz   chkpatch
+            sdi   ' '
+            lbdf  skipspc
+
+            smi   ' '-'-'               ; is an option lead-in?
+            lbnz  badusage
+
+            lda   ra                    ; is it a -u option?
+            smi   'u'
+            lbnz  badusage
+
+            glo   rd                    ; set uninstall flag
+            ori   1
+            plo   rd
+
+            lda   ra                    ; if end of line, done, if space,
+            lbz   chkpatch              ;  check for another option
+            sdi   ' '
+            lbdf  skipspc
+
+badusage:   sep   scall                 ; if incorrect syntax then quit
+            dw    o_inmsg
+            db    'ERROR: Usage: pstwo [-u]',cr,lf,0
+            sep   sret
+
+
+            ; Check to see if our module is already installed by comparing
+            ; the code at the patch points to the code of our module. Only
+            ; checking the first few bytes of each is good enough.
+
+chkpatch:   ldi   patchtbl.1            ; Get point to table of patch points
+            phi   r7
+            ldi   patchtbl.0
+            plo   r7
+
+            sex   r9                    ; comparison below against m(r9)
+
+            lda   r7                    ; get address of kernel vector
+chkloop:    phi   r8
+            lda   r7
+            plo   r8
+
+            inc   r8                    ; skip jump opcode, get address 
+            lda   r8                    ;  vector points to
+            phi   r9
+            lda   r8
+            plo   r9
+
+            lda   r7                    ; get address of routine in code
+            phi   r8                    ;  program memory
+            lda   r7
+            plo   r8
+
+            ldi   10                    ; check just first 10 bytes
+            plo   re
+
+chkbyte:    lda   r8                    ; compare pointed-to code to ours,
+            sm                          ;  if no match, then install
+            inc   r9
+            lbnz  install
+
+            dec   re                    ; continue if not all bytes checked
+            glo   re
+            lbnz  chkbyte
+            
+            lda   r7                    ; continue if not all hooks checked
+            lbz   chkloop
+
+
+            ; If we are already installed, check if -u option given, and if
+            ; so, then uninstall.
+
+            glo   rd
+            ani   1
+            lbnz  uninst
+
+            sep   scall                 ; if incorrect syntax then quit
+            dw    o_inmsg
+            db    'ERROR: Already loaded, use [-u] to unload.',cr,lf,0
+            sep   sret
+
+
+            ; We verified module is already loaded and uninstall was
+            ; requested, so go ahead and restore the kernel vectors as
+            ; they were before we installed folm saved copy in module.
+
+uninst:     sex   r2
+
+            ldi   patchtbl.1            ; pointer to table of patch points
+            phi   r7
+            ldi   patchtbl.0
+            plo   r7
+
+            ghi   r8                    ; find pages offset from program to
+            str   r2                    ;  high memory module
+            ghi   r9
+            sm
+
+            str   r2                    ; save offset to find block later
+
+            adi   unpatch.1             ; pointer to saved hook value; get
+            phi   r8                    ;  offset into module via adi
+            ldi   unpatch.0
+            plo   r8
+
+            lda   r7                    ; pointer to kernel vector address,
+unploop:    phi   r9
+            lda   r7
+            plo   r9
+
+            inc   r9                    ; skip over lbr opcode, then
+            lda   r8                    ;  restore hook to original
+            str   r9
+            inc   r9
+            lda   r8
+            str   r9
+
+            inc   r7                    ; skip patch pointer
+            inc   r7
+
+            lda   r7                    
+            lbnz  unploop
+
+            ldn   r8                    ; also restore re.1 as it was
+            ghi   re
+
+
+            ; Lastly to uninstall, recover the address of the module memory
+            ; block in the heap and free it.
+
+            ldn   r2                    ; get page offset to module
+
+            adi   module.1              ; add to code address to get 
+            phi   rf                    ;  printer to module memory block
+            ldi   module.0
+            plo   rf
+
+            sep   scall                 ; deallocate to return to heap
+            dw    o_dealloc
+
+            sep   sret                  ; return to caller
+
+
+            ; If module is not installed, but uninstall option was given,
+            ; emit an error and quit.
+
+install:    glo   rd                    ; if -u not given then install
+            ani   1
+            lbz   allocmem
+
+            sep   scall                 ; otherwise emit error and quit
+            dw    o_inmsg
+            db    'ERROR: Unload [-u] given, but not loaded.',cr,lf,0
             sep   sret
 
 
@@ -88,10 +278,10 @@ main:       ldi   high k_ver            ; get pointer to kernel version
             ; address of block in register R8 and RF for copying code and
             ; hooking vectors and the length of code to copy in RB.
 
-allocmem:   ldi   high (end-module)     ; size of permanent code module
+allocmem:   ldi   (end-module).1        ; size of permanent code module
             phi   rb
             phi   rc
-            ldi   low (end-module)
+            ldi   (end-module).0
             plo   rb
             plo   rc
 
@@ -106,8 +296,7 @@ allocmem:   ldi   high (end-module)     ; size of permanent code module
 
             sep   scall                 ; if unable to get memory
             dw    o_inmsg
-            db    'ERROR: Unable to allocate heap memory',13,10,0
-
+            db    'ERROR: Unable to allocate heap memory',cr,lf,0
             sep   sret
 
 
@@ -115,9 +304,9 @@ allocmem:   ldi   high (end-module)     ; size of permanent code module
             ; was just allocated using RF for destination and RB for length.
             ; This burns RF and RB but R8 will still point to the block.
 
-copycode:   ldi   high module           ; get source address to copy from
+copycode:   ldi   module.1              ; get source address to copy from
             phi   rd
-            ldi   low module
+            ldi   module.0
             plo   rd
 
             glo   rf                    ; make a copy of block pointer
@@ -136,7 +325,7 @@ copyloop:   lda   rd                    ; copy code to destination address
             lbnz  copyloop
 
             ghi   r8                    ; put offset between source and
-            smi   high module           ;  destination onto stack
+            smi   module.1              ;  destination onto stack
             str   r2
 
             lbr   padname
@@ -159,56 +348,76 @@ padname:    glo   rc
             ; the copy in the heap. If there is a chain address needed for a
             ; hook, copy that to the module first in the same way.
 
-            ldi   high patchtbl         ; Get point to table of patch points
+            ldi   patchtbl.1            ; Get point to table of patch points
             phi   r7
-            ldi   low patchtbl
+            ldi   patchtbl.0
             plo   r7
 
-ptchloop:   lda   r7                    ; get address to patch, a zero
-            lbz   inivideo              ;  msb marks end of the table
-            phi   rd
-            lda   r7
-            plo   rd
-            inc   rd
+            ldi   unpatch.1             ; table of saved patch points in
+            add                         ;  persistent memory block
+            phi   r8
+            ldi   unpatch.0
+            plo   r8
 
-notchain:   lda   r7                    ; get module call point, adjust to
+            lda   r7                    ; get address to patch, 
+ptchloop:   phi   r9                    ;  skip over lbr opcode
+            lda   r7
+            plo   r9
+            inc   r9
+
+            lda   r9                    ; save existing address to restore
+            str   r8                    ;  if module is unloaded
+            inc   r8
+            ldn   r9
+            dec   r9
+            str   r8
+            inc   r8
+
+            lda   r7                    ; get module call point, adjust to
             add                         ;  heap, and update into vector jump
-            str   rd
-            inc   rd
+            str   r9
+            inc   r9
             lda   r7
-            str   rd
+            str   r9
 
-            lbr   ptchloop
+            lda   r7
+            lbnz  ptchloop
+
+            ghi   re
+            str   r8
 
 
             ; copy packed font bitmaps into pattern space
 
-inivideo:   sex   r3
+inivideo:   sex   r3                    ; inline data for out opcodes
 
-            out   VDPREG                ; set the 16K bit in the vdp before
-            db    080h                  ;  trying to write to memory
-            out   VDPREG
-            db    WRREG + 1
+#ifdef EXP_PORT
+            out   EXP_PORT              ; enable expander group
+            db    VDP_GROUP
+#endif
+            out   VDP_REG               ; set the 16K bit in the vdp before
+            db    VDP_REG_W + 0         ;  trying to write to memory
+            out   VDP_REG
+            db    VDP_REG_W + 1
 
-            ghi   r8
-            adi   1
+            ghi   r8                    ; page address of module variables
             phi   r7
 
-            sep   scall
-            dw    clsin
+            sep   scall                 ; clear screen
+            dw    cls
 
-            sex   r3
+            sex   r3                    ; inline data for out opcodes
 
-            out   VDPREG                ; setup write to pattern table memory
-            db    low (patterns+32*8)
-            out   VDPREG
-            db    WRRAM + high (patterns+32*8)
+            out   VDP_REG               ; setup write to pattern table memory
+            db    (pattern+32*8).0
+            out   VDP_REG
+            db    (pattern+32*8).1 + VDP_RAM_W
 
-            sex   r2
+            sex   r2                    ; back to stack pointer
 
-            ldi   low fontdata          ; get pointer to packed font table
+            ldi   fontdata.0            ; get pointer to packed font table
             plo   r7
-            ldi   high fontdata
+            ldi   fontdata.1
             phi   r7
 
             ldi   96                    ; number of character patterns to load
@@ -240,7 +449,7 @@ bitcopy:    plo   r8                    ; process an output bit
             shl
 
             str   r2                    ; output pattern to vdp memory
-            out   VDPRAM
+            out   VDP_RAM
             dec   r2
 
             dec   ra                    ; count character patten rows
@@ -248,7 +457,7 @@ bitcopy:    plo   r8                    ; process an output bit
             lbnz  byteloop
 
             str   r2                    ; if 7 rows stored, add a zero row
-            out   VDPRAM
+            out   VDP_RAM
             dec   r2
 
             dec   r9                    ; count 96 characters to load
@@ -265,9 +474,9 @@ bitcopy:    plo   r8                    ; process an output bit
 
             sep   scall                 ; display identity to indicate success
             dw    o_inmsg
-            db    '9918 Video Driver Build 1 for Elf/OS',13,10,0
+            db    '9918 + PS/2 Driver Build 2 for Elf/OS',cr,lf,0
 
-            sep   r5
+            sep   sret                  ; done, return to elf/os
 
 
             ; Table giving addresses of jump vectors we need to update to
@@ -330,160 +539,192 @@ fontdata:   db    0h,0h,0h,0h,4h,21h,8h,40h,11h,4ah,50h,0h,0h,29h
             ; heap block. Since the address of this block cannot be known,
             ; the code is written to be relocatable, so start at a new page.
 
-            org     (($ + 0ffh) & 0ff00h)
+            org   (($ + 0ffh) & 0ff00h)
+
+
+            ; Several of the following subroutines are setup to be able to
+            ; called either via SCALL for API compatibility, or via a simple
+            ; SEP, which is used to sae SCALL overhead when routines are
+            ; calling each other. These will generally have two entry points
+            ; and end with both SEP R3 and SEP SRET; the SEP R3 is effectively
+            ; a no-op when called via SCALL as PC will already be R3.
+
 
 module:     ; Initialize text mode screen. This sets the VDP registers and
-            ; loads the character set into the patten memory, and then falls
+            ; loads the character set into the pattern memory, and then falls
             ; through to the clear screen code which clears name  memory and
             ; initializes variables.
 
-init:       sex   r3
+init:       sex   r3                    ; inline data for out opcodes
 
-            out   VDPREG
+initsep:    out   VDP_REG
             db    0h                    ; m3=0, external=0
-            out   VDPREG
-            db    WRREG + 0
+            out   VDP_REG
+            db    VDP_REG_W + 0
 
-            out   VDPREG
+            out   VDP_REG
             db    0d0h                  ; 16k=1, blank=1, m1=1, m2=0
-            out   VDPREG
-            db    WRREG + 1
+            out   VDP_REG
+            db    VDP_REG_W + 1
 
-            out   VDPREG
-            db    names >> 10           ; name table address
-            out   VDPREG
-            db    WRREG + 2
+            out   VDP_REG
+            db    names / 1024          ; name table address
+            out   VDP_REG
+            db    VDP_REG_W + 2
 
-            out   VDPREG
-            db    patterns >> 11        ; pattern attribute address
-            out   VDPREG
-            db    WRREG + 4
+            out   VDP_REG
+            db    pattern / 2048        ; pattern attribute address
+            out   VDP_REG
+            db    VDP_REG_W + 4
 
-            out   VDPREG 
-            db    0f4h                  ; text and background color
-            out   VDPREG
-            db    WRREG + 7
+            out   VDP_REG 
+            db    fgcolor*16 + bgcolor  ; text and background color
+            out   VDP_REG
+            db    VDP_REG_W + 7
 
-            sep   r5
+            sep   r3                    ; return from either sep or scall
+            sep   sret
 
 
-            ; clear name table
+            ; Clear screen by filling name table with spaces, and reset the
+            ; cursor to the start of the screen and the column to zero.
+            ; Assumes r7.1 is already loaded with the variable page address.
 
-cls:        ghi   r3
-            adi   1
-            phi   r7
+cls:        sex   r7                    ; for pointer to data variables
 
-clsin:      sex   r7
-
-            ldi   low column
+            ldi   column.0              ; point to colum variable
             plo   r7
 
-            ldi   0
+            ldi   0                     ; clear column, point to cursor
             str   r7
             inc   r7
 
-            ldi   low names
+            ldi   names.0              ; set cursor to start of name table,
+            str   r7                    ;  set write address to name table
+            out   VDP_REG
+            ldi   names.1 + VDP_RAM_W
             str   r7
-            out   VDPREG
+            out   VDP_REG
 
-            ldi   WRRAM + high names
+            ldi   ' '                   ; space char to fill screen with
             str   r7
-            out   VDPREG
 
-            ldi   32
-            str   r7
-            inc   r7
+            ldi   (chars+cols) / 4      ; number of loops to clear screen
 
-            out   VDPRAM
+clsloop:    out   VDP_RAM               ; write spaces to screen, loop is
+            dec   r7                    ;  unrolled by factor of four
+            out   VDP_RAM               ;  for speed by reducing overhead
             dec   r7
+            out   VDP_RAM
             dec   r7
-
-            ldi   25*40/4
-            lskp
-
-clsloop:    out   VDPRAM
-            dec   r7
-            out   VDPRAM
-            dec   r7
-            out   VDPRAM
-            dec   r7
-            out   VDPRAM
+            out   VDP_RAM
             dec   r7
 
-            smi   1
+            smi   1                     ; continue filling until done
             bnz   clsloop
 
-            sep   r5
+            sep   r3                    ; return by either sep or sret
+            sep   sret
 
-            ;
 
-msg:        glo   r8
+            ; Following are the o_msg and o_inmsg replacements to output
+            ; strings. These call type via SEP so that all the setup steps
+            ; and SCALL overhead only need to be done once, for performance.
+
+msg:        glo   r8                    ; push r8 (use for return address)
             stxd
 
-            ldi   msgstr
+            ldi   msgstr                ; get return address and jump
             br    push
 
-inmsg:      glo   r8
+inmsg:      glo   r8                    ; push r8 (use for return address)
             stxd
 
-            ldi   inmsgstr
+            ldi   inmsgstr              ; get return address and fall through
 
-push:       plo   r8
 
-            ghi   r8
-            stxd
-            glo   r7
+            ; Common initialization subroutine for both msg and inmsg. This
+            ; is called via BR and returns with PLO R3 to passed address.
+
+push:       plo   r8                    ; save return address
+
+            ghi   r8                    ; push the rest of r8 which will be
+            stxd                        ;  used for sep pc, as well as r7
+            glo   r7                    ;  which is used for varable pointer
             stxd
             ghi   r7
             stxd
 
-            ghi   r3
-            adi   1
+            ghi   r3                    ; initialize page part of r7 and r8
+            adi   1                     ;  to point to data and code
             phi   r7
             adi   1
             phi   r8
 
-            sex   r7
+#ifdef EXP_PORT
+            sex   r3                    ; if expander in use, set port group
+            out   EXP_PORT
+            db    VDP_GROUP
+#endif
+            sex   r7                    ; x will reference data variables
 
-            glo   r8
+            glo   r8                    ; return from subroutine
             plo   r3
 
-msglp:      plo   re
+
+            ; Working code for msg which is returned to by subroutine
+            ; at the msgstr entry point.
+
+msglp:      plo   re                    ; set input argument and call type
             sep   r8
 
-msgstr:     ldi   low typesep
+msgstr:     ldi   typesep.0             ; need to set call address each time
             plo   r8
 
-            lda   rf
+            lda   rf                    ; get next character, loop if not done
             bnz   msglp
 
-            br    return
+            br    return                ; jump to common clean-up and return
 
-inmsglp:    plo   re
+
+            ; Working code for inmsg which is returned to by subroutine
+            ; at the inmsgstr entry point.
+
+inmsglp:    plo   re                    ; set input argument and call type
             sep   r8
 
-inmsgstr:   ldi   low typesep
+inmsgstr:   ldi   typesep.0             ; need to set call address each time
             plo   r8
 
-            lda   r6
+            lda   r6                    ; get next character, loop if not done
             bnz   inmsglp
 
-return:     inc   r2
+
+            ; Common clean-up and return for msg and inmsg routines.
+
+return:     inc   r2                    ; restore saved r7
             lda   r2
             phi   r7
             lda   r2
             plo   r7
-            lda   r2
+
+            lda   r2                    ; restore saved r8
             phi   r8
             ldn   r2
             plo   r8
 
-            sep   r5
+#ifdef EXP_PORT
+            sex   r3                    ; if expander, reset default group
+            out   EXP_PORT
+            db    0
+#endif
+            sep   sret                  ; return to caller
 
 
+            org   (($ + 0ffh) & 0ff00h)
 
-            org     (($ + 0ffh) & 0ff00h)
-
+            ; Lookup table for keyboard scan code conversion to ASCII.
+            ;
             ; The first byte is the scan code, if the high bit is set then
             ; it is an extended code that was prefixed with an E0 code.
             ; Following is the corresponding ASCII character, but if the high
@@ -504,7 +745,7 @@ keytable:   db          0dh, 09h
             db          23h, 'd' + 80h, 'D'
             db          24h, 'e' + 80h, 'E'
             db          25h, '4' + 80h, '$'
-            db          26h, '3' + 80h, '^'
+            db          26h, '3' + 80h, '#'
             db          29h, ' '
             db          2ah, 'v' + 80h, 'V'
             db          2bh, 'f' + 80h, 'F'
@@ -547,10 +788,25 @@ keytable:   db          0dh, 09h
             db    80h + 75h, 0bh
             db          76h, 1bh
 
-            db    0
+            db    0                     ; end of table marker
 
 
-            ; Variables used by type
+            ; Following are the various persistent variables, starting with
+            ; a table of the original kernel hook points we patched so that
+            ; they can be restored if module is unloaded.
+
+unpatch:    dw    o_type                ; kernel vectors we replaced with 
+            dw    o_tty                 ;  our own when we loaded
+            dw    o_msg
+            dw    o_inmsg
+            dw    o_readkey
+            dw    o_input
+            dw    o_input
+
+re1save:    db    0                     ; a place to save re.1 for unload
+
+
+            ; Variables used by type to manage cursor location.
 
 column:     db    0                     ; how many characters left in line
 cursor:     db    0                     ; address of the cursor in vram
@@ -559,10 +815,11 @@ cursor:     db    0                     ; address of the cursor in vram
             db    127                   ; cursor character
 
 
-            ; Variables used by read
+            ; Variables used by read to manage track keys and state.
 
 flags:      db    0
 state:      db    0
+
 
             ; Memory area to store and manipulate VRAM addresses to output
             ; to the VDP register port. Since the output has to happen from
@@ -574,18 +831,18 @@ dstaddr:    ds    2
 
 
             ; This buffer is used for scrolling and needs to be at the end of
-            ; the same page as the scroll routine since the rollover of the LSB
-            ; to 00 is used to check for the end of the buffer so we don't
-            ; need a separate counter.
+            ; the same page as the scroll routine since the rollover of the
+            ; LSB to 0 is used to check for the end of the buffer so we don't
+            ; need a separate loop counter. This is one screen line.
 
-            org     (($ + 0ffh + 40) & 0ff00h) - 40
+            org   (($ + 0ffh + cols) & 0ff00h) - cols
 
-buffer:     ds    40
+buffer:     ds    cols
 
 
             ; Start new page for more code.
 
-            org     (($ + 0ffh) & 0ff00h)
+            org   (($ + 0ffh) & 0ff00h)
 
 typejmp:    phi   r3
             br    typesep
@@ -606,27 +863,38 @@ type:       glo   r7                    ; r7 is used as pointer to data
             smi   1                     ;  this where data bytes are stored
             phi   r7
 
+#ifdef EXP_PORT
+            sex   r3                    ; if expander, set the group
+            out   EXP_PORT
+            db    VDP_GROUP
+#endif
+
 typesep:    sex   r7                    ; r7 will point to most data we use
 
-            ldi   low cursor            ; point r7 to cursor location
+            ldi   cursor.0              ; point r7 to cursor location
             plo   r7
 
             glo   re                    ; get character
 
-            smi   32                    ; if printable characters, display
+            smi   ' '                   ; if printable characters, display
             bdf   typepr
 
-            adi   32-13                 ; if carriage return, move cursor
+            adi   ' '-cr                ; if carriage return, move cursor
             bz    typecr
 
-            adi   13-10                 ; if line feed, move cursor
+            adi   cr-lf                 ; if line feed, move cursor
             bz    typelf
 
-            adi   10-8                  ; if backspace, move cursor
+            adi   lf-bs                 ; if backspace, move cursor
             bz    typebs
 
 typeret:    sep   r3                    ; return if called via sep
 
+#ifdef EXP_PORT
+            sex   r3                    ; if expander, set default group
+            out   EXP_PORT
+            db    0
+#endif
             inc   r2                    ; restore saved r7 from stack
             lda   r2
             phi   r7
@@ -634,45 +902,46 @@ typeret:    sep   r3                    ; return if called via sep
             plo   r7
 
             glo   re                    ; restore character and return
-            sep   r5                    ;  if called via scall
+            sep   sret                  ;  if called via scall
 
 
             ; Output printable character to screen, advance cursor, and
             ; if at end of the screen, then scroll up.
 
-typepr:     out   VDPREG                ; output cursor address to vdp
-            out   VDPREG
+typepr:     out   VDP_REG                ; output cursor address to vdp
+            out   VDP_REG
 
             glo   re                    ; write character to vdp memory
             str   r7
-            out   VDPRAM
+            out   VDP_RAM
 
-            ldi   low column            ; point to column variable
+            ldi   column.0              ; point to column variable
             plo   r7
 
             ldn   r7                    ; if column number is 39, wrap to
-            smi   39                    ;  zero, otherwise add one
+            smi   cols-1                ;  zero, otherwise add one
             lsz
-            adi   40
+            adi   cols
             str   r7
 
             inc   r7                    ; point to cursor address
 
             lda   r7                    ; if cursor is at last position of
-            smi   low (names+959)       ;  screen, then go and scroll up
+            smi   (names+chars-1).0     ;  screen, then go and scroll up
             ldn   r7
-            smbi  WRRAM + high (names+959)
+            smbi  (names+chars-1).1 + VDP_RAM_W
             bdf   scrollcr
 
             dec   r7                    ; otherwise, advance cursor by
             ldn   r7                    ;  one location
             adi   1
             str   r7
+            bnf   typeret
+
             inc   r7
             ldn   r7
-            adci  0
+            adi   1
             str   r7
-
             br    typeret
 
 
@@ -681,19 +950,19 @@ typepr:     out   VDPREG                ; output cursor address to vdp
 
 typecr:     dec   r7                    ; point to column number
 
-            lda   r7                    ; subtract column number from the
-            sd                          ;  cursor position
-            str   r7
-            inc   r7
+            lda   r7                    ; subtract column number from
+            sd                          ;  cursor position and update
+            stxd
+
+            ldi   0                     ; set column number to zero, return
+            str   r7                    ;  if no borrow from lsb
+            bdf   typeret
+
+            inc   r7                    ; update cursor location msb
+            inc   r7                    ;  and return
             ldn   r7
-            smbi  0
+            smi   1
             str   r7
-
-            dec   r7                    ; move back to column number and
-            dec   r7                    ;  reset to zero
-            ldi   0
-            str   r7
-
             br   typeret
 
 
@@ -701,30 +970,31 @@ typecr:     dec   r7                    ; point to column number
             ; already on the last line, then scroll.
 
 typelf:     lda   r7                    ; if cursor is on last line, just
-            smi   low (names+920)       ;  scroll content up one line
+            smi   (names+chars-cols).0  ;  scroll content up one line
             ldn   r7
-            smbi  WRRAM + high (names+920)
+            smbi  (names+chars-cols).1 + VDP_RAM_W
             bdf   scroll
 
-            dec   r7                    ; otherwise, add 40 to cursor position
-            ldn   r7                    ;  to move down by one line
-            adi   40
+            dec   r7                    ; otherwise, add cols to cursor pos
+            ldn   r7                    ;  to move down by one line, return
+            adi   cols                  ;  if no carry
             str   r7
-            inc   r7
+            bnf   typeret
+
+            inc   r7                    ; update msb since carry and return
             ldn   r7
             adci  0
             str   r7
-
-            br   typeret
+            br    typeret
 
 
             ; Perform backspace by moving cursor one byte backwards, unless
             ; we are already at the start of the screen.
 
 typebs:     lda   r7                    ; if in first position of screeen,
-            smi   low (names+1)         ;  then just return
+            smi   (names+1).0           ;  then just return
             ldn   r7
-            smbi  WRRAM + high (names+1)
+            smbi  (names+1).1 + VDP_RAM_W
             bnf   typeret
 
             dec   r7                    ; move to column pointer
@@ -732,20 +1002,21 @@ typebs:     lda   r7                    ; if in first position of screeen,
 
             ldn   r7                    ; if column is zero then set to 39,
             lsnz                        ;  otherwise subtract one
-            ldi   40
+            ldi   cols
             smi   1
             str   r7
             inc   r7
 
-            ldn   r7                    ; subtract one from cursor position
-            smi   1
+            ldn   r7                    ; subtract one from cursor position,
+            smi   1                     ;  return if no borrow
             str   r7
-            inc   r7
+            bdf   typeret
+
+            inc   r7                    ; update msb for borrow and return
             ldn   r7
-            smbi  0
+            smi   1
             str   r7
-
-            br   typeret
+            br    typeret
 
 
             ; Scroll the screen up by copying one line at a time from VRAM
@@ -753,67 +1024,67 @@ typebs:     lda   r7                    ; if in first position of screeen,
             ; copying directly from VRAM to VRAM or the memory consumption
             ; of a full screen-sized buffer.
 
-scrollcr:   ldi   WRRAM + high (names+920)
+scrollcr:   ldi   (names+chars-cols).1 + VDP_RAM_W
             stxd
-            ldi   low (names+920)       ; move cursor to start of last line
+            ldi   (names+chars-cols).0  ; move cursor to start of last line
             str   r7
 
-scroll:     ldi   low (dstaddr+1)       ; point to cursor location addresses
+scroll:     ldi   (dstaddr+1).0         ; point to cursor location addresses
             plo   r7
 
-            ldi   WRRAM + high (names-40)
+            ldi   (names-cols).1 + VDP_RAM_W
             stxd
-            ldi   low (names-40)        ; set destination to -1 line for write
+            ldi   (names-cols).0        ; set destination to -1 line for write
             stxd
 
-            ldi   high names            ; set source to first line for read
+            ldi   names.1               ; set source to first line for read
             stxd                        ;  and leave r7 pointing to address
-            ldi   low names
+            ldi   names.0
             str   r7
 
 scrollln:   ldn   r7                    ; advance source address by one line
-            adi   40                    ;  and load new address into vdp for
+            adi   cols                  ;  and load new address into vdp for
             str   r7                    ;  read
-            out   VDPREG
+            out   VDP_REG
             ldn   r7
             adci  0
             str   r7
-            out   VDPREG
+            out   VDP_REG
 
-            ldi   low buffer            ; repoint r7 to bounce buffer
+            ldi   buffer.0              ; repoint r7 to bounce buffer
             plo   r7
 
-scrollrd:   inp   VDPRAM                ; fill buffer from display memeory
+scrollrd:   inp   VDP_RAM                ; fill buffer from display memeory
             inc   r7
             glo   r7
             bnz   scrollrd
 
             dec   r7                    ; move pointer back to right page
-            ldi   low dstaddr           ;  then point to destinaton address
+            ldi   dstaddr.0             ;  then point to destinaton address
             plo   r7
 
             ldn   r7                    ; advance destination address by 
-            adi   40                    ;  one line and load into vdp for
+            adi   cols                  ;  one line and load into vdp for
             str   r7                    ;  write
-            out   VDPREG
+            out   VDP_REG
             ldn   r7
             adci  0
             str   r7
-            out   VDPREG
+            out   VDP_REG
 
-            ldi   low buffer            ; repoint r7 to bounce buffer
+            ldi   buffer.0              ; repoint r7 to bounce buffer
             plo   r7
 
-scrollwr:   out   VDPRAM                ; write buffer to display memory
+scrollwr:   out   VDP_RAM               ; write buffer to display memory
             glo   r7
             bnz   scrollwr
 
             dec   r7                    ; repoint r7 to source address
-            ldi   low srcaddr
+            ldi   srcaddr.0
             plo   r7
 
             ldn   r7                    ; if whole screen not done then
-            smi   low 24*40             ;  scroll another line
+            smi   (rows*cols).0         ;  scroll another line
             bnz   scrollln
 
             br    typeret
@@ -827,37 +1098,42 @@ scrollwr:   out   VDPRAM                ; write buffer to display memory
 readjmp:    phi   r3
             br    readsep
 
-read:       glo   r7
+read:       glo   r7                    ; push r7 to use as variables pointer
             stxd
             ghi   r7
             stxd
  
-            ghi   r3
+            ghi   r3                    ; set msb of r7 to variables page
             smi   2
             phi   r7
 
-            sex   r7
+#ifdef EXP_PORT
+            sex   r3                    ; if expander, set port group
+            out   EXP_PORT
+            db    VDP_GROUP
+#endif
+            sex   r7                    ; x is variables pointer
 
-readsep:    ldi   low cursor
+readsep:    ldi   cursor.0              ; point to cursor variable
             plo   r7
 
-            out   VDPREG
+            out   VDP_REG
             lda   r7
-            ani   WRRAM ^ 0ffh
+            ani   VDP_RAM_W ^ 0ffh
             str   r7
-            out   VDPREG
+            out   VDP_REG
             dec   r7
-            inp   VDPRAM
+            inp   VDP_RAM
 
-            ldi   low cursor
+            ldi   cursor.0
             plo   r7
 
-            out   VDPREG
-            out   VDPREG
+            out   VDP_REG
+            out   VDP_REG
             inc   r7
-            out   VDPRAM
+            out   VDP_RAM
 
-discard:    ldi   low flags
+discard:    ldi   flags.0
             plo   r7
 
             lda   r7                    ; get working copy of flags into re.0
@@ -875,27 +1151,27 @@ getcode:    ldi   0ffh                  ; fill input byte to count data bits
             br    ps2loop               ;  and go receive data bits
 
 ps2zero:    seq                         ; switch back to clock line,
-            bn2   $                     ;  wait until clock goes high
+            PS2_N $                     ;  wait until clock goes high
 
             shr                         ; shift in a zero bit,
             bnf   ps2done               ;  done if 8 bits have been received
 
-ps2loop:    b2    $                     ; wait for clock to go low
+ps2loop:    PS2_P $                     ; wait for clock to go low
 
             req                         ; switch to sampling data line,
-            bn2   ps2zero               ;  jump based on data line state
+            PS2_N ps2zero               ;  jump based on data line state
 
             seq                         ; switch back to clock line,
-            bn2   $                     ;  wait until clock goes high
+            PS2_N $                     ;  wait until clock goes high
 
             shrc                        ; shift in a one bit,
             bdf   ps2loop               ;  loop until 8 bits have been received
 
-ps2done:    b2    $                     ; wait a clock pulse
-            bn2   $                     ;  to discard the parity bit
+ps2done:    PS2_P $                     ; wait a clock pulse
+            PS2_N $                     ;  to discard the parity bit
 
-            b2    $                     ; wait until stop bit
-            bn2   $
+            PS2_P $                     ; wait until stop bit
+            PS2_N $
             req                         ;  drop clock line to disable sender
 
 
@@ -994,7 +1270,7 @@ dolookup:   glo   re                    ; update modifier flags into memory
             dec   r7                    ;  byte so they survive across calls
             str   r7
 
-            ldi   low keytable          ; get pointer to keyboard mapping
+            ldi   keytable.0            ; get pointer to keyboard mapping
             plo   r7                    ;  table
 
             inc   r7                    ; advance to next table entry
@@ -1061,12 +1337,12 @@ notcaps:    ldn   r7                    ; if no modifier, just strip high bit
 
 output:     plo   re
 
-            ldi   low cursor
+            ldi   cursor.0
             plo   r7
 
-            out   VDPREG
-            out   VDPREG
-            out   VDPRAM
+            out   VDP_REG
+            out   VDP_REG
+            out   VDP_RAM
 
             sep   r3
 
@@ -1084,6 +1360,11 @@ dontecho:   inc   r2
             ldn   r2
             plo   r7
  
+#ifdef EXP_PORT
+            sex   r3
+            out   EXP_PORT
+            db    0
+#endif
             glo   re
             sep   sret
 
@@ -1091,9 +1372,9 @@ dontecho:   inc   r2
 
             org   (($ + 0ffh) & 0ff00h)
 
-input:      ldi   high 256              ; preset for fixed-size version
+input:      ldi   256.1                 ; preset for fixed-size version
             phi   rc
-            ldi   low 256
+            ldi   256.0
             plo   rc
 
 inputl:     dec   rc                    ; space for terminating zero
@@ -1121,13 +1402,32 @@ inputl:     dec   rc                    ; space for terminating zero
             smi   3
             phi   r7
 
-            sex   r7
+#ifdef EXP_PORT
+            sex   r3
+            out   EXP_PORT
+            db    VDP_GROUP
+#endif
+            ghi   r6
+            smi   20h
+            bdf   getchar
 
-getchar:    ghi   r3
+            ghi   r3
+            smi   4
+            phi   r8
+
+            ldi   initsep.0
+            plo   r8
+
+            sex   r8
+            sep   r8
+
+getchar:    sex   r7
+
+            ghi   r3
             smi   1
             phi   r8
 
-            ldi   low readsep
+            ldi   readsep.0
             plo   r8
             sep   r8
 
@@ -1137,21 +1437,21 @@ getchar:    ghi   r3
 
             glo   re                    ; get character
 
-            smi   127                   ; got backspace
+            smi   del                   ; got backspace
             bz    gotbksp
 
             bdf   getchar               ; has high bit set, ignore
 
-            adi   127-32                ; printing character received
+            adi   del-' '               ; printing character received
             bdf   gotprnt
  
-            adi   32-8                  ; backspace received
+            adi   ' '-bs                ; backspace received
             bz    gotbksp
 
-            adi   8-3                   ; control-c received
+            adi   bs-etx                ; control-c received
             bz    gotctlc
 
-            adi   3-13                  ; carriage return received
+            adi   etx-cr                ; carriage return received
             bnz   getchar
 
 
@@ -1172,17 +1472,22 @@ gotctlc:    str   rf                    ; zero-terminate input string
             glo   re                    ;  input char to stack along the way
             str   r2
             dec   r2
-            smbi  13
+            smbi  cr
             bnz   notecho
 
-            ldi   low typesep
+            ldi   typesep.0
             plo   r8
             sep   r8
 
 notecho:    inc   r2                    ; get back character typed, if 3
-            ldn   r2                    ;  then set df, if 13 then clear df
+            ldn   r2                    ;  then set df, if cr then clear df
             sdi   3
 
+#ifdef EXP_PORT
+            sex   r3
+            out   EXP_PORT
+            db    0
+#endif
             inc   r2                    ; restore saved r7 register
             lda   r2
             phi   r7
@@ -1217,7 +1522,7 @@ addprnt:    glo   re
             shr
             bnf   getchar
 
-            ldi   low typesep
+            ldi   typesep.0
             plo   r8
             sep   r8
 
@@ -1242,16 +1547,18 @@ dobkspc:    dec   rf                    ; back up pointer
             shr
             bnf   getchar
 
-            ldi   low typesep
+            ldi   typesep.0
             plo   r8
             sep   r8
 
-            dec   r7
-            out   VDPREG
-            out   VDPREG
+            ldi   cursor.0
+            plo   r7
+
+            out   VDP_REG
+            out   VDP_REG
             ldi   32
             str   r7
-            out   VDPRAM
+            out   VDP_RAM
 
             br    getchar
 
